@@ -1,0 +1,3 @@
+# Keep the standalone web app and byte-for-byte pinned vendor source separate
+# from the Electron project's formatter and staged-file hook.
+kaspion-web/
