@@ -136,7 +136,10 @@ export function createJobs(
       if (!result.success) {
         const known = {
           INVALID_PASSWORD: "פרטי הכניסה לא התקבלו. יש לבדוק אותם ולנסות שוב.",
-          CHANGE_PASSWORD: "הבנק דורש שינוי סיסמה. יש להיכנס לאתר הבנק.",
+          CHANGE_PASSWORD:
+            connection.provider === "isracard"
+              ? "אתר ישראכרט ביקש שינוי סיסמה או השלמת תהליך כניסה. היכנסו לאתר ישראכרט, השלימו את ההנחיות שם, ואז נסו לסנכרן שוב. לא יובאו נתונים בסנכרון הזה."
+              : "הבנק דורש שינוי סיסמה. יש להיכנס לאתר הבנק.",
           ACCOUNT_BLOCKED: "החשבון חסום. יש לפנות לבנק.",
           TIMEOUT: "החיבור לבנק ארך זמן רב מדי.",
         };
@@ -145,6 +148,10 @@ export function createJobs(
             "הבנק לא החזיר נתונים. ייתכן שנדרש אישור באתר הבנק או שהסורק דורש עדכון.",
         );
       }
+      if (!Array.isArray(result.accounts) || result.accounts.length === 0)
+        throw new Error(
+          "הסנכרון הסתיים בלי חשבונות או כרטיסים. לא יובאו נתונים. בדקו שיש חשבון פעיל באתר החברה ונסו שוב; אם הוא מופיע שם, ייתכן שהסורק דורש עדכון.",
+        );
       job.count = importAccounts(store, connection.id, result.accounts || []);
       store.db
         .prepare("UPDATE connections SET synced_at=? WHERE id=?")
@@ -162,7 +169,9 @@ export function createJobs(
               : error.message?.startsWith("פרטי") ||
                   error.message?.startsWith("הבנק") ||
                   error.message?.startsWith("החשבון") ||
-                  error.message?.startsWith("החיבור")
+                  error.message?.startsWith("החיבור") ||
+                  error.message?.startsWith("אתר ישראכרט") ||
+                  error.message?.startsWith("הסנכרון הסתיים בלי")
                 ? error.message
                 : "לא הצלחנו להשלים את הסנכרון. בדקו את החיבור ונסו שוב.",
         );

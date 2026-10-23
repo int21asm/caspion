@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import { addMizrahiBalanceFallback } from "./mizrahi-balance.js";
 const require = createRequire(import.meta.url);
 const library = require("israeli-bank-scrapers");
 export const { createScraper, SCRAPERS } = library;
@@ -47,6 +48,9 @@ export async function liveScrape({
       companyId: connection.provider,
       startDate: new Date(Date.now() - settings.daysBack * 86400000),
       combineInstallments: settings.combineInstallments,
+      // Cal can return already-scheduled card activity beyond the next bill.
+      // Fetch three future billing months for month-specific cash-flow data.
+      ...(connection.provider === "visaCal" ? { futureMonthsToScrape: 3 } : {}),
       timeout: 45000,
       verbose: false,
     };
@@ -68,11 +72,28 @@ export async function liveScrape({
     signal.addEventListener("abort", stop, { once: true });
     try {
       const scraper = createScraper(options);
+      if (connection.provider === "mizrahi") addMizrahiBalanceFallback(scraper);
       scraper.onProgress((_, payload) => progress(payload.type));
       const input = { ...credentials };
       if (connection.provider === "oneZero")
         input.otpCodeRetriever = requestMfa;
-      return await scraper.scrape(input);
+      const result = await scraper.scrape(input);
+      // Visa Cal exposes the next debit amount and debit date through its
+      // account balance fields. Keep this separate from the card's current
+      // balance so the dashboard can label it accurately.
+      if (connection.provider === "visaCal" && result.success) {
+        for (const account of result.accounts || []) {
+          if (
+            Number.isFinite(account.balance) &&
+            typeof account.balanceDate === "string" &&
+            Number.isFinite(Date.parse(account.balanceDate))
+          ) {
+            account.nextChargeAmount = Math.abs(account.balance);
+            account.nextChargeDate = account.balanceDate;
+          }
+        }
+      }
+      return result;
     } finally {
       signal.removeEventListener("abort", stop);
     }

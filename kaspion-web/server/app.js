@@ -15,6 +15,10 @@ import { createStore, hash } from "./store.js";
 import { providers, providerById } from "./providers.js";
 import { seedDemo } from "./demo.js";
 import { createJobs } from "./jobs.js";
+import { createAiAuth } from "./ai-auth.js";
+import { createAiChat } from "./ai-chat.js";
+import { createCategoryJobs } from "./category-jobs.js";
+import { normalizeCurrency } from "../shared/currency.js";
 const scrypt = promisify(scryptCallback);
 const root = fileURLToPath(new URL("../", import.meta.url));
 const validCredentials = z
@@ -31,8 +35,16 @@ const schema = z.object({
 });
 const settingsSchema = z
   .object({
-    daysBack: z.number().int().min(1).max(365),
+    daysBack: z.number().int().min(1).max(730),
     combineInstallments: z.boolean(),
+    monthlyIncome: z.number().int().min(0).max(1_000_000_000).default(0),
+    monthlyCardEstimate: z.number().int().min(0).max(1_000_000_000).nullable().default(null),
+    cardEstimatesByMonth: z
+      .record(
+        z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/),
+        z.number().int().min(0).max(1_000_000_000),
+      )
+      .default({}),
   })
   .strict();
 const publicUser = (u) => ({
@@ -47,6 +59,7 @@ export async function createApplication({
   live = process.env.ENABLE_LIVE_SCRAPING === "true",
   production = process.env.NODE_ENV === "production",
   jobsOptions,
+  aiOptions,
   development = false,
 } = {}) {
   if (production && !process.env.CREDENTIAL_KEY)
@@ -56,6 +69,9 @@ export async function createApplication({
   const store = createStore(dataDir),
     { db } = store;
   const jobs = createJobs(store, jobsOptions);
+  const aiAuth = createAiAuth(store, aiOptions);
+  const aiChat = createAiChat(store, aiAuth, aiOptions);
+  const categoryJobs = createCategoryJobs(store, aiChat, aiAuth);
   const app = express();
   app.disable("x-powered-by");
   app.use(helmet({ contentSecurityPolicy: development ? false : undefined }));
@@ -91,7 +107,7 @@ export async function createApplication({
   });
   function session(req, res, user) {
     const token = randomBytes(32).toString("base64url");
-    const cookieName = production ? "__Host-kaspion" : "kaspion";
+    const cookieName = production ? "__Host-shklops" : "shklops";
     const old = req.headers.cookie
       ?.split("; ")
       .find((c) => c.startsWith(`${cookieName}=`))
@@ -112,7 +128,7 @@ export async function createApplication({
     });
   }
   app.use("/api", (req, _res, next) => {
-    const name = production ? "__Host-kaspion" : "kaspion";
+    const name = production ? "__Host-shklops" : "shklops";
     const token = req.headers.cookie
       ?.split("; ")
       .find((c) => c.startsWith(`${name}=`))
@@ -193,12 +209,39 @@ export async function createApplication({
   app.post("/api/auth/logout", (req, res) => {
     // Revoke every session for this account, including this browser's cookie.
     db.prepare("DELETE FROM sessions WHERE user_id=?").run(req.user.id);
-    res.clearCookie(production ? "__Host-kaspion" : "kaspion", { path: "/" });
+    res.clearCookie(production ? "__Host-shklops" : "shklops", { path: "/" });
     res.json({ ok: true });
   });
   app.get("/api/providers", (_req, res) => res.json(providers));
+  const aiLimit = rateLimit({ windowMs: 60000, limit: 12, standardHeaders: "draft-8", legacyHeaders: false,
+    message: { error: "יותר מדי שאלות. נסו שוב בעוד דקה." } });
+  app.get("/api/ai/status", (req, res) => res.json(aiAuth.status(req.user.id)));
+  app.post("/api/ai/connect", aiLimit, async (req, res) => {
+    const { newAccount } = z.object({ newAccount: z.boolean().optional() }).strict().parse(req.body);
+    const origin = process.env.APP_ORIGIN || `http://${req.get("host")}`;
+    res.json({ url: await aiAuth.start(req.user.id, origin, { newAccount }) });
+  });
+  app.post("/api/ai/disconnect", aiLimit, async (req, res) => res.json(await aiAuth.disconnect(req.user.id)));
+  app.get("/api/ai/models", aiLimit, async (req, res) => res.json(await aiChat.models(req.user.id)));
+  app.post("/api/ai/ask", aiLimit, async (req, res) => {
+    const { question, model, history } = z.object({ question: z.string().trim().min(2).max(1000),
+      model: z.string().max(100).optional(), history: z.array(z.object({
+        question: z.string().max(1000), answer: z.string().max(4000),
+      }).strict()).max(4).optional() }).strict().parse(req.body);
+    res.json(await aiChat.ask(req.user.id, question, model, history));
+  });
+  app.get("/api/ai/categorization", (req, res) => res.json(categoryJobs.status(req.user.id)));
+  app.post("/api/ai/categorization", aiLimit, (req, res) => {
+    const options = z.object({ refresh: z.boolean().optional(), generalOnly: z.boolean().optional(), model: z.string().max(100).optional() }).strict().parse(req.body);
+    res.status(202).json(categoryJobs.start(req.user.id, options));
+  });
   app.get("/api/settings", (req, res) =>
-    res.json(JSON.parse(req.user.settings)),
+    res.json({
+      monthlyIncome: 0,
+      monthlyCardEstimate: null,
+      cardEstimatesByMonth: {},
+      ...JSON.parse(req.user.settings),
+    }),
   );
   app.put("/api/settings", (req, res) => {
     const settings = settingsSchema.parse(req.body);
@@ -221,12 +264,12 @@ export async function createApplication({
       .all(req.user.id);
     const transactions = db
       .prepare(
-        "SELECT t.*,a.number AS account_number,a.connection_id,c.provider,c.name AS connection_name FROM transactions t JOIN accounts a ON a.id=t.account_id JOIN connections c ON c.id=a.connection_id WHERE c.user_id=? ORDER BY t.date DESC,t.id DESC LIMIT 10000",
+        "SELECT t.*,a.number AS account_number,a.connection_id,c.provider,c.name AS connection_name FROM transactions t JOIN accounts a ON a.id=t.account_id JOIN connections c ON c.id=a.connection_id WHERE c.user_id=? AND a.enabled=1 ORDER BY t.date DESC,t.id DESC LIMIT 10000",
       )
       .all(req.user.id);
     const total = db
       .prepare(
-        "SELECT count(*) AS count FROM transactions t JOIN accounts a ON a.id=t.account_id JOIN connections c ON c.id=a.connection_id WHERE c.user_id=?",
+        "SELECT count(*) AS count FROM transactions t JOIN accounts a ON a.id=t.account_id JOIN connections c ON c.id=a.connection_id WHERE c.user_id=? AND a.enabled=1",
       )
       .get(req.user.id).count;
     const runs = db
@@ -236,12 +279,49 @@ export async function createApplication({
       .all(req.user.id);
     res.json({
       connections,
-      accounts,
-      transactions,
+      accounts: accounts.map((account) => ({
+        ...account,
+        enabled: Boolean(account.enabled),
+        next_charge:
+          account.next_charge ??
+          (account.provider === "visaCal" && Number.isFinite(account.balance)
+            ? Math.abs(account.balance)
+            : null),
+        currency: normalizeCurrency(account.currency),
+      })),
+      transactions: transactions.map((transaction) => ({
+        ...transaction,
+        currency: normalizeCurrency(transaction.currency),
+      })),
       runs,
       truncated: total > transactions.length,
       total,
     });
+  });
+  app.patch("/api/accounts/:id", (req, res) => {
+    const { enabled } = z.object({ enabled: z.boolean() }).strict().parse(req.body);
+    const account = db.prepare(
+      "SELECT a.id,a.connection_id,a.number,c.provider FROM accounts a JOIN connections c ON c.id=a.connection_id WHERE a.id=? AND c.user_id=?",
+    ).get(req.params.id, req.user.id);
+    if (!account) return res.status(404).json({ error: "הכרטיס לא נמצא" });
+    if (providerById[account.provider]?.kind !== "card")
+      return res.status(400).json({ error: "ניתן לבחור ייבוא לכרטיסי אשראי בלבד" });
+    if (jobs.activeForConnection(account.connection_id))
+      return res.status(409).json({ error: "יש להמתין לסיום הסנכרון לפני שינוי בחירת הכרטיסים" });
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      db.prepare("UPDATE connections SET card_selection_configured=1 WHERE id=?")
+        .run(account.connection_id);
+      db.prepare("UPDATE accounts SET enabled=?,balance=NULL,next_charge=NULL,next_charge_date=NULL WHERE connection_id=? AND number=?")
+        .run(Number(enabled), account.connection_id, account.number);
+      if (!enabled) db.prepare("DELETE FROM transactions WHERE account_id IN (SELECT id FROM accounts WHERE connection_id=? AND number=?)")
+        .run(account.connection_id, account.number);
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+    res.json({ enabled });
   });
   app.post("/api/connections", (req, res) => {
     const input = z
@@ -363,7 +443,14 @@ export async function createApplication({
       res.sendFile(path.join(root, "dist/index.html")),
     );
   }
-  app.use((error, _req, res, _next) => {
+  app.use((error, req, res, _next) => {
+    const requestId = randomUUID();
+    const frames = String(error.cause?.stack || error.stack || "").split("\n")
+      .filter((line) => /^\s+at\s/.test(line)).slice(0, 3);
+    console.error(JSON.stringify({ event: "request_failed", requestId,
+      route: req.route?.path || "unknown", method: req.method, status: error instanceof z.ZodError ? 400 : error.status || 500,
+      name: error.name, code: error.aiCode || null, stage: error.aiStage || null, frames }));
+    res.set("X-Request-Id", requestId);
     if (error instanceof z.ZodError)
       return res.status(400).json({
         error: "יש לבדוק את השדות ולנסות שוב",
@@ -371,6 +458,7 @@ export async function createApplication({
       });
     res.status(error.status || 500).json({
       error: error.status ? error.message : "אירעה שגיאה בשרת. נסו שוב.",
+      requestId,
     });
   });
   return {
@@ -379,6 +467,8 @@ export async function createApplication({
     jobs,
     close: async () => {
       jobs.shutdown();
+      aiAuth.close();
+      categoryJobs.shutdown();
       await vite?.close();
       store.close();
     },

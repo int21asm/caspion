@@ -5,12 +5,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import request from "supertest";
 import { createApplication } from "../server/app.js";
-import { importAccounts } from "../server/store.js";
+import { importAccounts, hash } from "../server/store.js";
+import { bankDate } from "../shared/calendar.js";
 
 process.env.APP_ORIGIN = "http://localhost:3002";
 const origin = process.env.APP_ORIGIN;
 async function setup(t, options = {}) {
-  const directory = mkdtempSync(path.join(tmpdir(), "kaspion-test-"));
+  const directory = mkdtempSync(path.join(tmpdir(), "shklops-test-"));
   const runtime = await createApplication({ dataDir: directory, ...options });
   t.after(async () => {
     await runtime.close();
@@ -111,9 +112,20 @@ test("users cannot access each other’s accounts, transactions, credentials or 
   await alice
     .put("/api/settings")
     .set("Origin", origin)
-    .send({ daysBack: 30, combineInstallments: true })
+    .send({
+      daysBack: 730,
+      combineInstallments: true,
+      monthlyCardEstimate: 250000,
+      cardEstimatesByMonth: { "2026-12": 400000, "2027-01": 600000 },
+    })
     .expect(200);
+  assert.equal((await alice.get("/api/settings")).body.monthlyCardEstimate, 250000);
+  assert.equal((await alice.get("/api/settings")).body.daysBack, 730);
+  await alice.put("/api/settings").set("Origin", origin).send({ daysBack: 731, combineInstallments: true }).expect(400);
+  assert.equal((await alice.get("/api/settings")).body.cardEstimatesByMonth["2026-12"], 400000);
   assert.equal((await bob.get("/api/settings")).body.daysBack, 90);
+  assert.equal((await bob.get("/api/settings")).body.monthlyCardEstimate, null);
+  assert.deepEqual((await bob.get("/api/settings")).body.cardEstimatesByMonth, {});
   assert.equal(
     (
       await bob
@@ -331,6 +343,225 @@ test("repeated imports deduplicate, preserve distinct identical purchases, updat
   );
 });
 
+test("Israeli bank calendar dates survive UTC month and DST boundaries", () => {
+  assert.equal(bankDate("2026-09-30T21:00:00.000Z"), "2026-10-01");
+  assert.equal(bankDate("2026-01-31T22:00:00.000Z"), "2026-02-01");
+  assert.equal(bankDate("2026-10-10"), "2026-10-10");
+  assert.equal(bankDate("2026-10-10T21:00:00.000Z"), "2026-10-11");
+});
+
+test("existing card currency symbols are normalized in API data without rewriting stored transactions", async (t) => {
+  const { agent, store } = await setup(t);
+  const a = agent();
+  await register(a);
+  const {
+    body: { id },
+  } = await post(a, "/api/connections", {
+    provider: "visaCal",
+    name: "Synthetic card",
+  });
+  importAccounts(store, id, [
+    {
+      accountNumber: "test",
+      currency: "₪",
+      balance: 0,
+      txns: [
+        {
+          identifier: "card-purchase",
+          date: "2026-10-10",
+          chargedAmount: -12,
+          chargedCurrency: "₪",
+          description: "Synthetic purchase",
+          processedDate: "2026-11-02",
+          installments: { number: 1, total: 3 },
+        },
+      ],
+    },
+  ]);
+  const response = await a.get("/api/data");
+  assert.equal(response.status, 200);
+  assert.equal(response.body.accounts[0].currency, "ILS");
+  assert.equal(response.body.transactions[0].currency, "ILS");
+  assert.equal(response.body.transactions[0].processed_date, "2026-11-02");
+  assert.equal(response.body.transactions[0].installment_number, 1);
+  assert.equal(response.body.transactions[0].installment_total, 3);
+  assert.ok(response.body.transactions[0].installment_group);
+  assert.equal(
+    store.db.prepare("SELECT currency FROM transactions").get().currency,
+    "₪",
+  );
+});
+
+test("card selection removes excluded data and persists across later imports", async (t) => {
+  const { agent, store } = await setup(t);
+  const owner = agent();
+  await register(owner);
+  const { body: { id: connectionId } } = await post(owner, "/api/connections", {
+    provider: "visaCal", name: "Synthetic cards",
+  });
+  const card = (number) => ({
+    accountNumber: number, currency: "ILS", balance: -42,
+    txns: [{ identifier: `purchase-${number}`, date: "2026-10-10",
+      processedDate: "2026-11-10", chargedAmount: -21, chargedCurrency: "ILS",
+      description: "Synthetic purchase" }],
+  });
+  importAccounts(store, connectionId, [card("1111"), card("2222")]);
+  const original = (await owner.get("/api/data")).body;
+  const kept = original.accounts.find((account) => account.number === "1111");
+  const excluded = original.accounts.find((account) => account.number === "2222");
+  assert.equal(original.transactions.length, 2);
+  const other = agent();
+  await register(other, "other@example.com");
+  assert.equal((await other.patch(`/api/accounts/${excluded.id}`).set("Origin", origin).send({ enabled: false })).status, 404);
+  assert.equal((await owner.patch(`/api/accounts/${excluded.id}`).set("Origin", origin).send({ enabled: false })).status, 200);
+  let data = (await owner.get("/api/data")).body;
+  assert.equal(data.accounts.find((account) => account.id === excluded.id).enabled, false);
+  assert.equal(data.transactions.length, 1);
+  assert.equal(data.transactions[0].account_id, kept.id);
+  assert.equal(store.db.prepare("SELECT count(*) AS count FROM transactions WHERE account_id=?").get(excluded.id).count, 0);
+  importAccounts(store, connectionId, [card("1111"), card("2222"), card("3333")]);
+  data = (await owner.get("/api/data")).body;
+  assert.equal(data.accounts.find((account) => account.number === "3333").enabled, false,
+    "newly discovered cards require an explicit choice after the selection is configured");
+  assert.equal(data.transactions.length, 1);
+  assert.equal((await owner.patch(`/api/accounts/${excluded.id}`).set("Origin", origin).send({ enabled: true })).status, 200);
+  assert.equal((await owner.get("/api/data")).body.transactions.length, 1,
+    "enabling a card does not revive deleted transactions until the next sync");
+  importAccounts(store, connectionId, [card("1111"), card("2222")]);
+  data = (await owner.get("/api/data")).body;
+  assert.equal(data.transactions.length, 2);
+  assert.equal(data.accounts.find((account) => account.id === excluded.id).enabled, true);
+});
+
+test("resync corrects legacy Mizrahi dates without duplicating identified or identical identifier-less transactions", async (t) => {
+  const { agent, store } = await setup(t);
+  const a = agent();
+  await register(a);
+  const {
+    body: { id },
+  } = await post(a, "/api/connections", { provider: "mizrahi", name: "Test" });
+  const credit = {
+    identifier: "salary",
+    date: "2026-10-01",
+    description: "Synthetic credit",
+    chargedAmount: 100,
+    status: "completed",
+  };
+  const purchase = {
+    date: "2026-10-01",
+    description: "Synthetic purchase",
+    chargedAmount: -10,
+    status: "completed",
+  };
+  const account = {
+    accountNumber: "test",
+    currency: "ILS",
+    txns: [credit, purchase, { ...purchase }],
+  };
+  assert.equal(importAccounts(store, id, [account]), 3);
+  // Reproduce rows written by the previous UTC-date importer.
+  const rows = store.db.prepare("SELECT * FROM transactions ORDER BY id").all();
+  let occurrence = 0;
+  for (const row of rows) {
+    if (row.amount > 0) {
+      store.db
+        .prepare("UPDATE transactions SET date=?,source_date=NULL WHERE id=?")
+        .run("2026-09-30", row.id);
+    } else {
+      const identity = JSON.stringify([
+        "2026-09-30",
+        purchase.description,
+        -1000,
+        "ILS",
+        0,
+      ]);
+      const fingerprint = hash(`${identity}:${occurrence++}`);
+      store.db
+        .prepare(
+          "UPDATE transactions SET id=?,fingerprint=?,date=?,source_date=NULL WHERE id=?",
+        )
+        .run(
+          hash(`${row.account_id}:${fingerprint}`),
+          fingerprint,
+          "2026-09-30",
+          row.id,
+        );
+    }
+  }
+  const fresh = {
+    ...account,
+    txns: account.txns.map((tx) => ({
+      ...tx,
+      date: "2026-09-30T21:00:00.000Z",
+    })),
+  };
+  assert.equal(importAccounts(store, id, [fresh]), 0);
+  assert.equal(importAccounts(store, id, [fresh]), 0);
+  const corrected = store.db
+    .prepare("SELECT date,source_date,amount FROM transactions")
+    .all();
+  assert.equal(corrected.length, 3);
+  assert.ok(
+    corrected.every(
+      (tx) =>
+        tx.date === "2026-10-01" &&
+        tx.source_date === "2026-09-30T21:00:00.000Z",
+    ),
+  );
+  assert.equal(corrected.filter((tx) => tx.amount < 0).length, 2);
+});
+
+test("Mizrahi identifier changes do not double dashboard income or real identical purchases", async (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "shklops-mizrahi-"));
+  let runtime = await createApplication({ dataDir: directory });
+  t.after(async () => {
+    await runtime.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const a = request.agent(runtime.app);
+  await register(a);
+  const { body: { id } } = await post(a, "/api/connections", {
+    provider: "mizrahi", name: "Synthetic bank",
+  });
+  const txns = [
+    { identifier: "salary", description: "Salary", chargedAmount: 19417.45 },
+    { identifier: "refund", description: "Refund", chargedAmount: 41.51 },
+    { identifier: "mortgage", description: "Mortgage", chargedAmount: -6662.30 },
+    { identifier: "purchase-1", description: "Coffee", chargedAmount: -10 },
+    { identifier: "purchase-2", description: "Coffee", chargedAmount: -10 },
+  ].map((tx) => ({ ...tx, date: "2026-10-01" }));
+  const account = { accountNumber: "test", currency: "ILS", balance: 1921.4, txns };
+  assert.equal(importAccounts(runtime.store, id, [account]), 5);
+  // Reproduce old keys derived from bank reference numbers, which changed
+  // before a later import of the same statement.
+  for (const row of runtime.store.db.prepare("SELECT id,account_id FROM transactions").all()) {
+    const fingerprint = hash(`old-bank-reference:${row.id}`);
+    runtime.store.db.prepare("UPDATE transactions SET id=?,fingerprint=? WHERE id=?")
+      .run(hash(`${row.account_id}:${fingerprint}`), fingerprint, row.id);
+  }
+  const laterAccount = { ...account, txns: [
+    ...txns,
+    { identifier: "new-purchase-1", date: "2026-10-15", description: "Lunch", chargedAmount: -12 },
+    { identifier: "new-purchase-2", date: "2026-10-15", description: "Lunch", chargedAmount: -12 },
+  ] };
+  assert.equal(importAccounts(runtime.store, id, [laterAccount]), 7);
+  assert.equal((await a.get("/api/data")).body.transactions.length, 12);
+  await runtime.close();
+  runtime = await createApplication({ dataDir: directory });
+  const reopened = request.agent(runtime.app);
+  assert.equal((await post(reopened, "/api/auth/login", {
+    email: "person@example.com", password: "correct horse battery staple",
+  })).status, 200);
+  const data = (await reopened.get("/api/data")).body;
+  assert.equal(data.transactions.length, 7);
+  assert.equal(data.total, 7);
+  assert.equal(data.transactions.filter((tx) => tx.amount > 0).reduce((sum, tx) => sum + tx.amount, 0), 1945896);
+  assert.equal(data.transactions.filter((tx) => tx.description === "Coffee").length, 2);
+  assert.equal(data.transactions.filter((tx) => tx.description === "Lunch").length, 2);
+  assert.equal(importAccounts(runtime.store, id, [laterAccount]), 0);
+  assert.equal((await reopened.get("/api/data")).body.transactions.length, 7);
+});
+
 test("live scraping stays disabled by default and credentials are not accepted in that mode", async (t) => {
   const { agent, store } = await setup(t);
   const a = agent();
@@ -379,6 +610,43 @@ test("a bank failure is sanitized and never imports its data", async (t) => {
   const data = await a.get("/api/data");
   assert.equal(data.body.transactions.length, 0);
   assert.ok(!data.text.includes("sensitive bank payload"));
+});
+
+test("Isracard login and empty-result failures explain why no card data appears", async (t) => {
+  let response = { success: false, errorType: "CHANGE_PASSWORD" };
+  const { agent } = await setup(t, {
+    live: true,
+    jobsOptions: { adapter: async () => response },
+  });
+  const a = agent();
+  await register(a);
+  const {
+    body: { id },
+  } = await post(a, "/api/connections", {
+    provider: "isracard",
+    name: "Card test",
+  });
+  const sync = () =>
+    post(a, `/api/connections/${id}/sync`, {
+      credentials: { id: "000000000", card6Digits: "123456", password: "test-only" },
+    });
+  assert.equal((await sync()).status, 202);
+  let job = await waitFor(a, "failed");
+  assert.match(job.error, /אתר ישראכרט ביקש שינוי סיסמה/);
+  assert.match(job.error, /לא יובאו נתונים/);
+  response = { success: true, accounts: [] };
+  assert.equal((await sync()).status, 202);
+  for (let i = 0; i < 150; i++) {
+    const jobs = (await a.get("/api/jobs")).body;
+    job = jobs.find((entry) => entry.id !== job.id && entry.status === "failed");
+    if (job) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.match(job.error, /בלי חשבונות או כרטיסים/);
+  const data = (await a.get("/api/data")).body;
+  assert.equal(data.accounts.length, 0);
+  assert.equal(data.connections.find((connection) => connection.id === id).status, "failed");
+  assert.equal(data.runs[0].error, job.error);
 });
 
 test("a delayed MFA callback cannot resurrect a cancelled run", async (t) => {
